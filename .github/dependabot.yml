@@ -1,11 +1,21 @@
 version: 2
 updates:
-- package-ecosystem: cargo
-  directory: "/"
-  schedule:
-    interval: daily
-  open-pull-requests-limit: 10
-  ignore:
-  - dependency-name: serde
-    versions:
-    - 1.0.124
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Group dependency updates into a single pull request.
+    groups:
+      dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Group dependency updates into a single pull request.
+    groups:
+      dependencies:
+        patterns:
+          - "*"

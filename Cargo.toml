@@ -1,13 +1,9 @@
 [workspace]
-members = [
-    "lychee-bin",
-    "lychee-lib",
-    "examples/*",
-]
+members = ["lychee-bin", "lychee-lib", "examples/*", "benches"]
+resolver = "2"
 
-[patch.crates-io]
-# Switch back to version on crates.io after 0.6.3+ is released
-hubcaps = { git="https://github.com/softprops/hubcaps.git" }
+[workspace.package]
+version = "0.18.0"
 
 [profile.release]
 debug = true

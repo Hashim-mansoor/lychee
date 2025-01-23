@@ -55,81 +55,126 @@
     variant_size_differences,
     clippy::missing_const_for_fn
 )]
-#![deny(anonymous_parameters, macro_use_extern_crate, pointer_structural_match)]
+#![deny(anonymous_parameters, macro_use_extern_crate)]
 #![deny(missing_docs)]
 
-// required for apple silicon
-use ring as _;
-use stats::color_response;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, ErrorKind, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
-use std::iter::FromIterator;
-use std::{collections::HashSet, fs, str::FromStr};
+use anyhow::{bail, Context, Error, Result};
+use clap::Parser;
+use commands::CommandParams;
+use formatters::{get_stats_formatter, log::init_logging};
+use log::{error, info, warn};
 
-use anyhow::{anyhow, Context, Result};
-use headers::HeaderMapExt;
-use indicatif::{ProgressBar, ProgressStyle};
-use lychee_lib::{ClientBuilder, ClientPool, Collector, Input, Request, Response};
+#[cfg(feature = "native-tls")]
 use openssl_sys as _; // required for vendored-openssl feature
-use regex::RegexSet;
-use ring as _; // required for apple silicon
-use structopt::StructOpt;
-use tokio::sync::mpsc;
 
-mod color;
+use options::LYCHEE_CONFIG_FILE;
+use ring as _; // required for apple silicon
+
+use lychee_lib::BasicAuthExtractor;
+use lychee_lib::Collector;
+use lychee_lib::CookieJar;
+
+mod archive;
+mod cache;
+mod client;
+mod commands;
+mod formatters;
 mod options;
 mod parse;
 mod stats;
-mod writer;
+mod time;
+mod verbosity;
 
-use crate::parse::{parse_basic_auth, parse_headers, parse_statuscodes, parse_timeout};
+use crate::formatters::color;
+use crate::formatters::duration::Duration;
 use crate::{
-    options::{Config, Format, LycheeOptions},
-    stats::ResponseStats,
-    writer::StatsWriter,
+    cache::{Cache, StoreExt},
+    formatters::stats::StatsFormatter,
+    options::{Config, LycheeOptions, LYCHEE_CACHE_FILE, LYCHEE_IGNORE_FILE},
 };
 
-const LYCHEE_IGNORE_FILE: &str = ".lycheeignore";
-
 /// A C-like enum that can be cast to `i32` and used as process exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitCode {
     Success = 0,
-    // NOTE: exit code 1 is used for any `Result::Err` bubbled up to `main()` using the `?` operator.
-    // For now, 1 acts as a catch-all for everything non-link related (including config errors),
-    // until we find a way to structure the error code handling better.
+    // NOTE: exit code 1 is used for any `Result::Err` bubbled up to `main()`
+    // using the `?` operator. For now, 1 acts as a catch-all for everything
+    // non-link related (including config errors), until we find a way to
+    // structure the error code handling better.
     #[allow(unused)]
     UnexpectedFailure = 1,
     LinkCheckFailure = 2,
+    ConfigFile = 3,
 }
 
+/// Ignore lines starting with this marker in `.lycheeignore` files
+const LYCHEEIGNORE_COMMENT_MARKER: &str = "#";
+
 fn main() -> Result<()> {
-    #[cfg(feature = "tokio-console")]
-    console_subscriber::init();
-    // std::process::exit doesn't guarantee that all destructors will be ran,
-    // therefore we wrap "main" code in another function to guarantee that.
+    // std::process::exit doesn't guarantee that all destructors will be run,
+    // therefore we wrap the main code in another function to ensure that.
     // See: https://doc.rust-lang.org/stable/std/process/fn.exit.html
     // Also see: https://www.youtube.com/watch?v=zQC8T71Y8e4
     let exit_code = run_main()?;
     std::process::exit(exit_code);
 }
 
-// Read lines from file; ignore empty lines
+/// Read lines from file; ignore empty lines
 fn read_lines(file: &File) -> Result<Vec<String>> {
     let lines: Vec<_> = BufReader::new(file).lines().collect::<Result<_, _>>()?;
-    Ok(lines.into_iter().filter(|line| !line.is_empty()).collect())
+    Ok(lines
+        .into_iter()
+        .filter(|line| {
+            !line.is_empty() && !line.trim_start().starts_with(LYCHEEIGNORE_COMMENT_MARKER)
+        })
+        .collect())
 }
 
-fn run_main() -> Result<i32> {
-    let mut opts = LycheeOptions::from_args();
+/// Merge all provided config options into one This includes a potential config
+/// file, command-line- and environment variables
+fn load_config() -> Result<LycheeOptions> {
+    let mut opts = LycheeOptions::parse();
 
-    // Load a potentially existing config file and merge it into the config from the CLI
-    if let Some(c) = Config::load_from_file(&opts.config_file)? {
-        opts.config.merge(c);
+    init_logging(&opts.config.verbose, &opts.config.mode);
+
+    // Load a potentially existing config file and merge it into the config from
+    // the CLI
+    if let Some(config_file) = &opts.config_file {
+        match Config::load_from_file(config_file) {
+            Ok(c) => opts.config.merge(c),
+            Err(e) => {
+                bail!(
+                    "Cannot load configuration file `{}`: {e:?}",
+                    config_file.display()
+                );
+            }
+        }
+    } else {
+        // If no config file was explicitly provided, we try to load the default
+        // config file from the current directory, but it's not an error if it
+        // doesn't exist.
+        if let Ok(c) = Config::load_from_file(&PathBuf::from(LYCHEE_CONFIG_FILE)) {
+            opts.config.merge(c);
+        }
     }
 
     if let Ok(lycheeignore) = File::open(LYCHEE_IGNORE_FILE) {
         opts.config.exclude.append(&mut read_lines(&lycheeignore)?);
+    }
+
+    // TODO: Remove this warning and the parameter with 1.0
+    if !&opts.config.exclude_file.is_empty() {
+        warn!("WARNING: `--exclude-file` is deprecated and will soon be removed; use the `{}` file to ignore URL patterns instead. To exclude paths of files and directories, use `--exclude-path`.", LYCHEE_IGNORE_FILE);
+    }
+
+    // TODO: Remove this warning and the parameter with 1.0
+    if opts.config.exclude_mail {
+        warn!("WARNING: `--exclude-mail` is deprecated and will soon be removed; E-Mail is no longer checked by default. Use `--include-mail` to enable E-Mail checking.");
     }
 
     // Load excludes from file
@@ -138,9 +183,76 @@ fn run_main() -> Result<i32> {
         opts.config.exclude.append(&mut read_lines(&file)?);
     }
 
-    let cfg = &opts.config;
+    Ok(opts)
+}
 
-    let runtime = match cfg.threads {
+/// Load cookie jar from path (if exists)
+fn load_cookie_jar(cfg: &Config) -> Result<Option<CookieJar>> {
+    match &cfg.cookie_jar {
+        Some(path) => Ok(CookieJar::load(path.clone()).map(Some)?),
+        None => Ok(None),
+    }
+}
+
+#[must_use]
+/// Load cache (if exists and is still valid)
+/// This returns an `Option` as starting without a cache is a common scenario
+/// and we silently discard errors on purpose
+fn load_cache(cfg: &Config) -> Option<Cache> {
+    if !cfg.cache {
+        return None;
+    }
+
+    // Discard entire cache if it hasn't been updated since `max_cache_age`.
+    // This is an optimization, which avoids iterating over the file and
+    // checking the age of each entry.
+    match fs::metadata(LYCHEE_CACHE_FILE) {
+        Err(_e) => {
+            // No cache found; silently start with empty cache
+            return None;
+        }
+        Ok(metadata) => {
+            let modified = metadata.modified().ok()?;
+            let elapsed = modified.elapsed().ok()?;
+            if elapsed > cfg.max_cache_age {
+                warn!(
+                    "Cache is too old (age: {}, max age: {}). Discarding and recreating.",
+                    Duration::from_secs(elapsed.as_secs()),
+                    Duration::from_secs(cfg.max_cache_age.as_secs())
+                );
+                return None;
+            }
+            info!(
+                "Cache is recent (age: {}, max age: {}). Using.",
+                Duration::from_secs(elapsed.as_secs()),
+                Duration::from_secs(cfg.max_cache_age.as_secs())
+            );
+        }
+    }
+
+    let cache = Cache::load(LYCHEE_CACHE_FILE, cfg.max_cache_age.as_secs());
+    match cache {
+        Ok(cache) => Some(cache),
+        Err(e) => {
+            warn!("Error while loading cache: {e}. Continuing without.");
+            None
+        }
+    }
+}
+
+/// Set up runtime and call lychee entrypoint
+fn run_main() -> Result<i32> {
+    use std::process::exit;
+
+    let opts = match load_config() {
+        Ok(opts) => opts,
+        Err(e) => {
+            error!("Error while loading config: {e}");
+            exit(ExitCode::ConfigFile as i32);
+        }
+    };
+
+    let runtime = match opts.config.threads {
         Some(threads) => {
             // We define our own runtime instead of the `tokio::main` attribute
             // since we want to make the number of threads configurable
@@ -152,183 +264,126 @@ fn run_main() -> Result<i32> {
         None => tokio::runtime::Runtime::new()?,
     };
 
-    runtime.block_on(run(cfg, opts.inputs()))
-}
-
-fn show_progress(progress_bar: &Option<ProgressBar>, response: &Response, verbose: bool) {
-    let out = color_response(&response.1);
-    if let Some(pb) = progress_bar {
-        pb.inc(1);
-        pb.set_message(&out);
-        if verbose {
-            pb.println(out);
+    match runtime.block_on(run(&opts)) {
+        Err(e) if Some(ErrorKind::BrokenPipe) == underlying_io_error_kind(&e) => {
+            exit(ExitCode::Success as i32);
         }
-    } else {
-        if (response.status().is_success() || response.status().is_excluded()) && !verbose {
-            return;
-        }
-        println!("{}", out);
+        res => res,
     }
 }
 
-async fn run(cfg: &Config, inputs: Vec<Input>) -> Result<i32> {
-    let mut headers = parse_headers(&cfg.headers)?;
-    if let Some(auth) = &cfg.basic_auth {
-        let auth_header = parse_basic_auth(auth)?;
-        headers.typed_insert(auth_header);
+/// Check if the given error can be traced back to an `io::ErrorKind`
+/// This is helpful for troubleshooting the root cause of an error.
+/// Code is taken from the anyhow documentation.
+fn underlying_io_error_kind(error: &Error) -> Option<io::ErrorKind> {
+    for cause in error.chain() {
+        if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+            return Some(io_error.kind());
+        }
     }
+    None
+}
 
-    let accepted = cfg.accept.clone().and_then(|a| parse_statuscodes(&a).ok());
-    let timeout = parse_timeout(cfg.timeout);
-    let max_concurrency = cfg.max_concurrency;
-    let method: reqwest::Method = reqwest::Method::from_str(&cfg.method.to_uppercase())?;
-    let include = RegexSet::new(&cfg.include)?;
-    let exclude = RegexSet::new(&cfg.exclude)?;
+/// Run lychee on the given inputs
+async fn run(opts: &LycheeOptions) -> Result<i32> {
+    let inputs = opts.inputs()?;
 
-    // Offline mode overrides the scheme
-    let schemes = if cfg.offline {
-        vec!["file".to_string()]
-    } else {
-        cfg.scheme.clone()
-    };
+    let mut collector = Collector::new(opts.config.root_dir.clone(), opts.config.base.clone())?
+        .skip_missing_inputs(opts.config.skip_missing)
+        .skip_hidden(!opts.config.hidden)
+        .skip_ignored(!opts.config.no_ignore)
+        .include_verbatim(opts.config.include_verbatim)
+        // File a bug if you rely on this envvar! It's going to go away eventually.
+        .use_html5ever(std::env::var("LYCHEE_USE_HTML5EVER").map_or(false, |x| x == "1"));
 
-    let client = ClientBuilder::builder()
-        .includes(include)
-        .excludes(exclude)
-        .exclude_all_private(cfg.exclude_all_private)
-        .exclude_private_ips(cfg.exclude_private)
-        .exclude_link_local_ips(cfg.exclude_link_local)
-        .exclude_loopback_ips(cfg.exclude_loopback)
-        .exclude_mail(cfg.exclude_mail)
-        .max_redirects(cfg.max_redirects)
-        .user_agent(cfg.user_agent.clone())
-        .allow_insecure(cfg.insecure)
-        .custom_headers(headers)
-        .method(method)
-        .timeout(timeout)
-        .github_token(cfg.github_token.clone())
-        .schemes(HashSet::from_iter(schemes))
-        .accepted(accepted)
-        .require_https(cfg.require_https)
-        .build()
-        .client()
-        .map_err(|e| anyhow!("Failed to create request client: {}", e))?;
+    if opts.config.dump_inputs {
+        let sources = collector.collect_sources(inputs);
+        let exit_code = commands::dump_inputs(
+            sources,
+            opts.config.output.as_ref(),
+            &opts.config.exclude_path,
+        )
+        .await?;
 
-    let links = Collector::new(cfg.base.clone(), cfg.skip_missing, max_concurrency)
-        .collect_links(&inputs)
-        .await
-        .map_err(|e| anyhow!(e))?;
-
-    if cfg.dump {
-        let exit_code = dump_links(
-            links.iter().filter(|link| !client.filtered(&link.uri)),
-            cfg.verbose,
-        );
         return Ok(exit_code as i32);
     }
 
-    let pb = if cfg.no_progress {
-        None
+    collector = if let Some(ref basic_auth) = opts.config.basic_auth {
+        collector.basic_auth_extractor(BasicAuthExtractor::new(basic_auth)?)
     } else {
-        let bar =
-            ProgressBar::new(links.len() as u64).with_style(ProgressStyle::default_bar().template(
-                "{spinner:.red.bright} {pos}/{len:.dim} [{elapsed_precise}] {bar:25} {wide_msg}",
-            ));
-        bar.enable_steady_tick(100);
-        Some(bar)
+        collector
     };
 
-    let (send_req, recv_req) = mpsc::channel(max_concurrency);
-    let (send_resp, mut recv_resp) = mpsc::channel(max_concurrency);
+    let requests = collector.collect_links(inputs);
 
-    let mut stats = ResponseStats::new();
+    let cache = load_cache(&opts.config).unwrap_or_default();
+    let cache = Arc::new(cache);
 
-    let bar = pb.clone();
-    tokio::spawn(async move {
-        for link in links {
-            if let Some(pb) = &bar {
-                pb.set_message(&link.to_string());
-            };
-            send_req.send(link).await.unwrap();
-        }
-    });
+    let cookie_jar = load_cookie_jar(&opts.config).with_context(|| {
+        format!(
+            "Cannot load cookie jar from path `{}`",
+            opts.config
+                .cookie_jar
+                .as_ref()
+                .map_or_else(|| "<none>".to_string(), |p| p.display().to_string())
+        )
+    })?;
 
-    // Start receiving requests
-    tokio::spawn(async move {
-        let clients = vec![client; max_concurrency];
-        let mut clients = ClientPool::new(send_resp, recv_req, clients);
-        clients.listen().await;
-    });
+    let client = client::create(&opts.config, cookie_jar.as_deref())?;
 
-    while let Some(response) = recv_resp.recv().await {
-        show_progress(&pb, &response, cfg.verbose);
-        stats.add(response);
-    }
-
-    // Note that print statements may interfere with the progress bar, so this
-    // must go before printing the stats
-    if let Some(pb) = &pb {
-        pb.finish_and_clear();
-    }
-
-    let writer: Box<dyn StatsWriter> = match cfg.format {
-        Format::Compact => Box::new(writer::Compact::new()),
-        Format::Detailed => Box::new(writer::Detailed::new()),
-        Format::Json => Box::new(writer::Json::new()),
-        Format::Markdown => Box::new(writer::Markdown::new()),
+    let params = CommandParams {
+        client,
+        cache,
+        requests,
+        cfg: opts.config.clone(),
     };
 
-    let code = if stats.is_success() {
-        ExitCode::Success
+    let exit_code = if opts.config.dump {
+        commands::dump(params).await?
     } else {
-        ExitCode::LinkCheckFailure
-    };
+        let (stats, cache, exit_code) = commands::check(params).await?;
 
-    write_stats(&*writer, stats, cfg)?;
+        let github_issues = stats
+            .error_map
+            .values()
+            .flatten()
+            .any(|body| body.uri.domain() == Some("github.com"));
 
-    Ok(code as i32)
-}
+        let stats_formatter: Box<dyn StatsFormatter> =
+            get_stats_formatter(&opts.config.format, &opts.config.mode);
 
-/// Dump all detected links to stdout without checking them
-fn dump_links<'a>(links: impl Iterator<Item = &'a Request>, verbose: bool) -> ExitCode {
-    let mut stdout = io::stdout();
-    for link in links {
-        // Avoid panic on broken pipe.
-        // See https://github.com/rust-lang/rust/issues/46016
-        // This can occur when piping the output of lychee
-        // to another program like `grep`.
+        let is_empty = stats.is_empty();
+        let formatted_stats = stats_formatter.format(stats)?;
 
-        // Only print source in verbose mode. This way the normal link output
-        // can be fed into another tool without data mangling.
-        let output = if verbose {
-            link.to_string()
-        } else {
-            link.uri.to_string()
-        };
-        if let Err(e) = writeln!(stdout, "{}", output) {
-            if e.kind() != io::ErrorKind::BrokenPipe {
-                eprintln!("{}", e);
-                return ExitCode::UnexpectedFailure;
+        if let Some(formatted_stats) = formatted_stats {
+            if let Some(output) = &opts.config.output {
+                fs::write(output, formatted_stats).context("Cannot write status output to file")?;
+            } else {
+                if opts.config.verbose.log_level() >= log::Level::Info && !is_empty {
+                    // separate summary from the verbose list of links above
+                    // with a newline
+                    writeln!(io::stdout())?;
+                }
+                // we assume that the formatted stats don't have a final newline
+                writeln!(io::stdout(), "{formatted_stats}")?;
             }
         }
-    }
-    ExitCode::Success
-}
 
-/// Write final statistics to stdout or to file
-fn write_stats(writer: &dyn StatsWriter, stats: ResponseStats, cfg: &Config) -> Result<()> {
-    let is_empty = stats.is_empty();
-    let formatted = writer.write(stats)?;
-
-    if let Some(output) = &cfg.output {
-        fs::write(output, formatted).context("Cannot write status output to file")?;
-    } else {
-        if cfg.verbose && !is_empty {
-            // separate summary from the verbose list of links above
-            println!();
+        if github_issues && opts.config.github_token.is_none() {
+            warn!("There were issues with GitHub URLs. You could try setting a GitHub token and running lychee again.",);
         }
-        // we assume that the formatted stats don't have a final newline
-        println!("{}", formatted);
-    }
-    Ok(())
+
+        if opts.config.cache {
+            cache.store(LYCHEE_CACHE_FILE)?;
+        }
+
+        if let Some(cookie_jar) = cookie_jar.as_ref() {
+            info!("Saving cookie jar");
+            cookie_jar.save().context("Cannot save cookie jar")?;
+        }
+
+        exit_code
+    };
+
+    Ok(exit_code as i32)
 }

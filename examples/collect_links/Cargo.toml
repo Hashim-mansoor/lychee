@@ -1,15 +1,22 @@
 [package]
 name = "collect_links"
 version = "0.1.0"
-edition = "2018"
+edition = "2021"
 
 [[example]]
 name = "collect_links"
 path = "collect_links.rs"
 
 [dependencies]
-lychee-lib = { path = "../../lychee-lib", version = "0.8.1" }
-tokio = { version = "1.14.0", features = ["full"] }
-regex = "1.4.6"
-http = "0.2.5"
-reqwest = { version = "0.11.6", features = ["gzip"] }
+lychee-lib = { path = "../../lychee-lib",  default-features = false }
+tokio = { version = "1.42.0", features = ["full"] }
+regex = "1.11.1"
+http = "1.2.0"
+tokio-stream = "0.1.17"
+reqwest = { version = "0.12.9", default-features = false, features = ["gzip"] }
+
+[features]
+email-check = ["lychee-lib/email-check"]
+native-tls = ["lychee-lib/native-tls", "reqwest/native-tls"]
+rustls-tls = ["lychee-lib/rustls-tls", "reqwest/rustls-tls-native-roots"]
+default = ["native-tls", "email-check"]

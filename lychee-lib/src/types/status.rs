@@ -2,9 +2,12 @@ use std::{collections::HashSet, fmt::Display};
 
 use http::StatusCode;
 use reqwest::Response;
+use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
 use crate::ErrorKind;
+
+use super::CacheStatus;
 
 const ICON_OK: &str = "\u{2714}"; // ✔
 const ICON_REDIRECTED: &str = "\u{21c4}"; // ⇄
@@ -13,6 +16,7 @@ const ICON_UNSUPPORTED: &str = "\u{003f}"; // ? (using same icon, but under diff
 const ICON_UNKNOWN: &str = "\u{003f}"; // ?
 const ICON_ERROR: &str = "\u{2717}"; // ✗
 const ICON_TIMEOUT: &str = "\u{29d6}"; // ⧖
+const ICON_CACHED: &str = "\u{21bb}"; // ↻
 
 /// Response status of the request.
 #[allow(variant_size_differences)]
@@ -21,7 +25,7 @@ pub enum Status {
     /// Request was successful
     Ok(StatusCode),
     /// Failed request
-    Error(Box<ErrorKind>),
+    Error(ErrorKind),
     /// Request timed out
     Timeout(Option<StatusCode>),
     /// Got redirected to different resource
@@ -31,22 +35,25 @@ pub enum Status {
     /// Resource was excluded from checking
     Excluded,
     /// The request type is currently not supported,
-    /// for example when the URL scheme is `slack://` or `file://`
-    /// See https://github.com/lycheeverse/lychee/issues/199
-    Unsupported(Box<ErrorKind>),
+    /// for example when the URL scheme is `slack://`.
+    /// See <https://github.com/lycheeverse/lychee/issues/199>
+    Unsupported(ErrorKind),
+    /// Cached request status from previous run
+    Cached(CacheStatus),
 }
 
 impl Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Status::Ok(c) => write!(f, "OK ({})", c),
-            Status::Redirected(c) => write!(f, "Redirect ({})", c),
-            Status::UnknownStatusCode(c) => write!(f, "Unknown status: {}", c),
-            Status::Excluded => f.write_str("Excluded"),
-            Status::Timeout(Some(c)) => write!(f, "Timeout ({})", c),
+            Status::Ok(code) => write!(f, "{code}"),
+            Status::Redirected(code) => write!(f, "Redirect ({code})"),
+            Status::UnknownStatusCode(code) => write!(f, "Unknown status ({code})"),
+            Status::Timeout(Some(code)) => write!(f, "Timeout ({code})"),
             Status::Timeout(None) => f.write_str("Timeout"),
-            Status::Unsupported(e) => write!(f, "Unsupported: {}", e),
-            Status::Error(e) => write!(f, "Failed: {}", e),
+            Status::Unsupported(e) => write!(f, "Unsupported: {e}"),
+            Status::Error(e) => write!(f, "{e}"),
+            Status::Cached(status) => write!(f, "{status}"),
+            Status::Excluded => Ok(()),
         }
     }
 }
@@ -56,12 +63,24 @@ impl Serialize for Status {
     where
         S: Serializer,
     {
-        serializer.collect_str(self)
+        let mut s;
+        if let Some(code) = self.code() {
+            s = serializer.serialize_struct("Status", 2)?;
+            s.serialize_field("text", &self.to_string())?;
+            s.serialize_field("code", &code.as_u16())?;
+        } else if let Some(details) = self.details() {
+            s = serializer.serialize_struct("Status", 2)?;
+            s.serialize_field("text", &self.to_string())?;
+            s.serialize_field("details", &details.to_string())?;
+        } else {
+            s = serializer.serialize_struct("Status", 1)?;
+            s.serialize_field("text", &self.to_string())?;
+        }
+        s.end()
     }
 }
 
 impl Status {
-    #[allow(clippy::missing_panics_doc)]
     #[must_use]
     /// Create a status object from a response and the set of accepted status codes
     pub fn new(response: &Response, accepted: Option<HashSet<StatusCode>>) -> Self {
@@ -79,25 +98,83 @@ impl Status {
         }
     }
 
+    /// Create a status object from a cached status (from a previous run of
+    /// lychee) and the set of accepted status codes.
+    ///
+    /// The set of accepted status codes can change between runs,
+    /// necessitating more complex logic than just using the cached status.
+    ///
+    /// Note that the accepted status codes are not of type `StatusCode`,
+    /// because they are provided by the user and can be invalid according to
+    /// the HTTP spec and IANA, but the user might still want to accept them.
+    #[must_use]
+    pub fn from_cache_status(s: CacheStatus, accepted: &HashSet<u16>) -> Self {
+        match s {
+            CacheStatus::Ok(code) => {
+                if matches!(s, CacheStatus::Ok(_)) || accepted.contains(&code) {
+                    return Self::Cached(CacheStatus::Ok(code));
+                };
+                Self::Cached(CacheStatus::Error(Some(code)))
+            }
+            CacheStatus::Error(code) => {
+                if let Some(code) = code {
+                    if accepted.contains(&code) {
+                        return Self::Cached(CacheStatus::Ok(code));
+                    };
+                }
+                Self::Cached(CacheStatus::Error(code))
+            }
+            _ => Self::Cached(s),
+        }
+    }
+
+    /// Return more details about the status (if any)
+    ///
+    /// Which additional information we can extract depends on the underlying
+    /// request type. The output is purely meant for humans and future changes
+    /// are expected.
+    ///
+    /// It is modeled after reqwest's `details` method.
+    #[must_use]
+    #[allow(clippy::match_same_arms)]
+    pub fn details(&self) -> Option<String> {
+        match &self {
+            Status::Ok(code) => code.canonical_reason().map(String::from),
+            Status::Redirected(code) => code.canonical_reason().map(String::from),
+            Status::Error(e) => e.details(),
+            Status::Timeout(_) => None,
+            Status::UnknownStatusCode(_) => None,
+            Status::Unsupported(_) => None,
+            Status::Cached(_) => None,
+            Status::Excluded => None,
+        }
+    }
+
     #[inline]
     #[must_use]
     /// Returns `true` if the check was successful
     pub const fn is_success(&self) -> bool {
-        matches!(self, Status::Ok(_))
+        matches!(self, Status::Ok(_) | Status::Cached(CacheStatus::Ok(_)))
     }
 
     #[inline]
     #[must_use]
     /// Returns `true` if the check was not successful
-    pub const fn is_failure(&self) -> bool {
-        matches!(self, Status::Error(_))
+    pub const fn is_error(&self) -> bool {
+        matches!(
+            self,
+            Status::Error(_) | Status::Cached(CacheStatus::Error(_)) | Status::Timeout(_)
+        )
     }
 
     #[inline]
     #[must_use]
     /// Returns `true` if the check was excluded
     pub const fn is_excluded(&self) -> bool {
-        matches!(self, Status::Excluded)
+        matches!(
+            self,
+            Status::Excluded | Status::Cached(CacheStatus::Excluded)
+        )
     }
 
     #[inline]
@@ -111,7 +188,10 @@ impl Status {
     #[must_use]
     /// Returns `true` if a URI is unsupported
     pub const fn is_unsupported(&self) -> bool {
-        matches!(self, Status::Unsupported(_))
+        matches!(
+            self,
+            Status::Unsupported(_) | Status::Cached(CacheStatus::Unsupported)
+        )
     }
 
     #[must_use]
@@ -125,13 +205,83 @@ impl Status {
             Status::Error(_) => ICON_ERROR,
             Status::Timeout(_) => ICON_TIMEOUT,
             Status::Unsupported(_) => ICON_UNSUPPORTED,
+            Status::Cached(_) => ICON_CACHED,
         }
+    }
+
+    #[must_use]
+    /// Return the HTTP status code (if any)
+    pub fn code(&self) -> Option<StatusCode> {
+        match self {
+            Status::Ok(code)
+            | Status::Redirected(code)
+            | Status::UnknownStatusCode(code)
+            | Status::Timeout(Some(code)) => Some(*code),
+            Status::Error(kind) | Status::Unsupported(kind) => {
+                if let Some(error) = kind.reqwest_error() {
+                    error.status()
+                } else {
+                    None
+                }
+            }
+            Status::Cached(CacheStatus::Ok(code) | CacheStatus::Error(Some(code))) => {
+                match StatusCode::from_u16(*code) {
+                    Ok(code) => Some(code),
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the HTTP status code as string (if any)
+    #[must_use]
+    pub fn code_as_string(&self) -> String {
+        match self {
+            Status::Ok(code) | Status::Redirected(code) | Status::UnknownStatusCode(code) => {
+                code.as_str().to_string()
+            }
+            Status::Excluded => "EXCLUDED".to_string(),
+            Status::Error(e) => match e {
+                ErrorKind::NetworkRequest(e)
+                | ErrorKind::ReadResponseBody(e)
+                | ErrorKind::BuildRequestClient(e) => match e.status() {
+                    Some(code) => code.as_str().to_string(),
+                    None => "ERROR".to_string(),
+                },
+                _ => "ERROR".to_string(),
+            },
+            Status::Timeout(code) => match code {
+                Some(code) => code.as_str().to_string(),
+                None => "TIMEOUT".to_string(),
+            },
+            Status::Unsupported(_) => "IGNORED".to_string(),
+            Status::Cached(cache_status) => match cache_status {
+                CacheStatus::Ok(code) => code.to_string(),
+                CacheStatus::Error(code) => match code {
+                    Some(code) => code.to_string(),
+                    None => "ERROR".to_string(),
+                },
+                CacheStatus::Excluded => "EXCLUDED".to_string(),
+                CacheStatus::Unsupported => "IGNORED".to_string(),
+            },
+        }
+    }
+
+    /// Returns true if the status code is unknown
+    /// (i.e. not a valid HTTP status code)
+    ///
+    /// For example, `200` is a valid HTTP status code,
+    /// while `999` is not.
+    #[must_use]
+    pub const fn is_unknown(&self) -> bool {
+        matches!(self, Status::UnknownStatusCode(_))
     }
 }
 
 impl From<ErrorKind> for Status {
     fn from(e: ErrorKind) -> Self {
-        Self::Error(Box::new(e))
+        Self::Error(e)
     }
 }
 
@@ -139,16 +289,79 @@ impl From<reqwest::Error> for Status {
     fn from(e: reqwest::Error) -> Self {
         if e.is_timeout() {
             Self::Timeout(e.status())
+        } else if e.is_redirect() {
+            Self::Error(ErrorKind::TooManyRedirects(e))
         } else if e.is_builder() {
-            Self::Unsupported(Box::new(ErrorKind::ReqwestError(e)))
+            Self::Unsupported(ErrorKind::BuildRequestClient(e))
+        } else if e.is_body() || e.is_decode() {
+            Self::Unsupported(ErrorKind::ReadResponseBody(e))
         } else {
-            Self::Error(Box::new(ErrorKind::ReqwestError(e)))
+            Self::Error(ErrorKind::NetworkRequest(e))
         }
     }
 }
 
-impl From<hubcaps::Error> for Status {
-    fn from(e: hubcaps::Error) -> Self {
-        Self::Error(Box::new(e.into()))
+#[cfg(test)]
+mod tests {
+    use crate::{CacheStatus, ErrorKind, Status};
+    use http::StatusCode;
+
+    #[test]
+    fn test_status_serialization() {
+        let status_ok = Status::Ok(StatusCode::from_u16(200).unwrap());
+        let serialized_with_code = serde_json::to_string(&status_ok).unwrap();
+        assert_eq!("{\"text\":\"200 OK\",\"code\":200}", serialized_with_code);
+
+        let status_timeout = Status::Timeout(None);
+        let serialized_without_code = serde_json::to_string(&status_timeout).unwrap();
+        assert_eq!("{\"text\":\"Timeout\"}", serialized_without_code);
+    }
+
+    #[test]
+    fn test_get_status_code() {
+        assert_eq!(
+            Status::Ok(StatusCode::from_u16(200).unwrap())
+                .code()
+                .unwrap(),
+            200
+        );
+        assert_eq!(
+            Status::Timeout(Some(StatusCode::from_u16(408).unwrap()))
+                .code()
+                .unwrap(),
+            408
+        );
+        assert_eq!(
+            Status::UnknownStatusCode(StatusCode::from_u16(999).unwrap())
+                .code()
+                .unwrap(),
+            999
+        );
+        assert_eq!(
+            Status::Redirected(StatusCode::from_u16(300).unwrap())
+                .code()
+                .unwrap(),
+            300
+        );
+        assert_eq!(Status::Cached(CacheStatus::Ok(200)).code().unwrap(), 200);
+        assert_eq!(
+            Status::Cached(CacheStatus::Error(Some(404)))
+                .code()
+                .unwrap(),
+            404
+        );
+        assert_eq!(Status::Timeout(None).code(), None);
+        assert_eq!(Status::Cached(CacheStatus::Error(None)).code(), None);
+        assert_eq!(Status::Excluded.code(), None);
+        assert_eq!(
+            Status::Unsupported(ErrorKind::InvalidStatusCode(999)).code(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_status_unknown() {
+        assert!(Status::UnknownStatusCode(StatusCode::from_u16(999).unwrap()).is_unknown());
+        assert!(!Status::Ok(StatusCode::from_u16(200).unwrap()).is_unknown());
     }
 }

@@ -1,6 +1,5 @@
 https://endler.dev
-test@example.org
-foo@bar.dev
-https://example.org
+test@example.com
+https://example.com
 octocat+github@github.com
-mailto:test2@example.org
+mailto:test2@example.com

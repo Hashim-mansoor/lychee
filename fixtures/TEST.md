@@ -1,7 +1,7 @@
 Check file link
 ![Logo](../assets/banner.svg)
 
-![Anchors should be ignored](#awesome)
+![Fragment only link](#awesome)
 
 Normal link, which should work as expected.
 [Wikipedia](https://en.wikipedia.org/wiki/Static_program_analysis)
@@ -16,8 +16,8 @@ Some more complex formatting to test that Markdown parsing works.
 [![CC0](https://i.creativecommons.org/p/zero/1.0/88x31.png)](https://creativecommons.org/publicdomain/zero/1.0/)
 
 Test HTTP and HTTPS for the same site.
-http://example.org
-https://example.org
+http://example.com
+https://example.com
 
-test@example.org
-mailto:test2@example.org
+test@example.com
+mailto:test2@example.com

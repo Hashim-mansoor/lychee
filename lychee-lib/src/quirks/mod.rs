@@ -1,11 +1,21 @@
+use crate::{
+    chain::{ChainResult, Handler},
+    Status,
+};
+use async_trait::async_trait;
 use header::HeaderValue;
-use http::{header, Method};
+use http::header;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::{Request, Url};
 use std::collections::HashMap;
 
-/// Sadly some pages only return plaintext results if Google is trying to crawl them.
-const GOOGLEBOT: &str = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://google.com/bot.html)";
+static CRATES_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(https?://)?(www\.)?crates.io").unwrap());
+static YOUTUBE_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(https?://)?(www\.)?youtube(-nocookie)?\.com").unwrap());
+static YOUTUBE_SHORT_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(https?://)?(www\.)?(youtu\.?be)").unwrap());
 
 // Retrieve a map of query params for the given request
 fn query(request: &Request) -> HashMap<String, String> {
@@ -14,7 +24,7 @@ fn query(request: &Request) -> HashMap<String, String> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Quirk {
-    pub(crate) pattern: Regex,
+    pub(crate) pattern: &'static Lazy<Regex>,
     pub(crate) rewrite: fn(Request) -> Request,
 }
 
@@ -27,46 +37,46 @@ impl Default for Quirks {
     fn default() -> Self {
         let quirks = vec![
             Quirk {
-                // Twitter cut off the ability to read a tweet by fetching its
-                // URL with a normal HTTP GET. Only Googlebot will get a plain
-                // HTML response.
-                // See https://twitter.com/zarfeblong/status/1339742840142872577
-                pattern: Regex::new(r"^(https?://)?(www\.)?twitter.com").unwrap(),
-                rewrite: |request| {
-                    let mut out = request;
-                    *out.method_mut() = Method::HEAD;
-                    out.headers_mut()
-                        .insert(header::USER_AGENT, GOOGLEBOT.parse().unwrap());
-                    out
-                },
-            },
-            Quirk {
-                pattern: Regex::new(r"^(https?://)?(www\.)?crates.io").unwrap(),
-                rewrite: |request| {
-                    let mut out = request;
-                    out.headers_mut()
+                pattern: &CRATES_PATTERN,
+                rewrite: |mut request| {
+                    request
+                        .headers_mut()
                         .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
-                    out
+                    request
                 },
             },
             Quirk {
-                // Even missing YouTube videos return a 200, therefore we use
-                // the thumbnail endpoint instead
-                // (https://img.youtube.com/vi/{video_id}/0.jpg).
-                // This works for all known video visibilities.
-                // See https://github.com/lycheeverse/lychee/issues/214#issuecomment-819103393)
-                pattern: Regex::new(r"^(https?://)?(www\.)?(youtube\.com|youtu\.?be)").unwrap(),
-                rewrite: |request| {
-                    if request.url().path() != "/watch" {
+                pattern: &YOUTUBE_PATTERN,
+                rewrite: |mut request| {
+                    // Extract video id if it's a video page
+                    let video_id = match request.url().path() {
+                        "/watch" => query(&request).get("v").map(ToOwned::to_owned),
+                        path if path.starts_with("/embed/") => {
+                            path.strip_prefix("/embed/").map(ToOwned::to_owned)
+                        }
+                        _ => return request,
+                    };
+
+                    // Only rewrite to thumbnail if we got a video id
+                    if let Some(id) = video_id {
+                        *request.url_mut() =
+                            Url::parse(&format!("https://img.youtube.com/vi/{id}/0.jpg")).unwrap();
+                    }
+
+                    request
+                },
+            },
+            Quirk {
+                pattern: &YOUTUBE_SHORT_PATTERN,
+                rewrite: |mut request| {
+                    // Short links use the path as video id
+                    let id = request.url().path().trim_start_matches('/');
+                    if id.is_empty() {
                         return request;
                     }
-                    let mut out = request;
-                    if let Some(id) = query(&out).get("v") {
-                        *out.url_mut() =
-                            Url::parse(&format!("https://img.youtube.com/vi/{}/0.jpg", &id))
-                                .unwrap();
-                    }
-                    out
+                    *request.url_mut() =
+                        Url::parse(&format!("https://img.youtube.com/vi/{id}/0.jpg")).unwrap();
+                    request
                 },
             },
         ];
@@ -89,14 +99,20 @@ impl Quirks {
     }
 }
 
+#[async_trait]
+impl Handler<Request, Status> for Quirks {
+    async fn handle(&mut self, input: Request) -> ChainResult<Request, Status> {
+        ChainResult::Next(self.apply(input))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use header::HeaderValue;
     use http::{header, Method};
-    use pretty_assertions::assert_eq;
     use reqwest::{Request, Url};
 
-    use super::{Quirks, GOOGLEBOT};
+    use super::Quirks;
 
     #[derive(Debug)]
     struct MockRequest(Request);
@@ -111,19 +127,6 @@ mod tests {
         fn eq(&self, other: &Self) -> bool {
             self.0.url() == other.0.url() && self.0.method() == other.0.method()
         }
-    }
-
-    #[test]
-    fn test_twitter_request() {
-        let url = Url::parse("https://twitter.com/zarfeblong/status/1339742840142872577").unwrap();
-        let request = Request::new(Method::GET, url.clone());
-        let modified = Quirks::default().apply(request);
-
-        assert_eq!(
-            modified.headers().get(header::USER_AGENT).unwrap(),
-            &GOOGLEBOT
-        );
-        assert_eq!(MockRequest(modified), MockRequest::new(Method::HEAD, url));
     }
 
     #[test]
@@ -144,6 +147,32 @@ mod tests {
         let request = Request::new(Method::GET, url);
         let modified = Quirks::default().apply(request);
         let expected_url = Url::parse("https://img.youtube.com/vi/NlKuICiT470/0.jpg").unwrap();
+
+        assert_eq!(
+            MockRequest(modified),
+            MockRequest::new(Method::GET, expected_url)
+        );
+    }
+
+    #[test]
+    fn test_youtube_video_nocookie_request() {
+        let url = Url::parse("https://www.youtube-nocookie.com/embed/BIguvia6AvM").unwrap();
+        let request = Request::new(Method::GET, url);
+        let modified = Quirks::default().apply(request);
+        let expected_url = Url::parse("https://img.youtube.com/vi/BIguvia6AvM/0.jpg").unwrap();
+
+        assert_eq!(
+            MockRequest(modified),
+            MockRequest::new(Method::GET, expected_url)
+        );
+    }
+
+    #[test]
+    fn test_youtube_video_shortlink_request() {
+        let url = Url::parse("https://youtu.be/Rvu7N4wyFpk?t=42").unwrap();
+        let request = Request::new(Method::GET, url);
+        let modified = Quirks::default().apply(request);
+        let expected_url = Url::parse("https://img.youtube.com/vi/Rvu7N4wyFpk/0.jpg").unwrap();
 
         assert_eq!(
             MockRequest(modified),

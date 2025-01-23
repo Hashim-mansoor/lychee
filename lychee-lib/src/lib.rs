@@ -1,12 +1,14 @@
-//! `lychee` is a library for checking links.
+//! `lychee-lib` is the library component of [`lychee`], and is used for checking links.
+//!
 //! "Hello world" example:
+//!
 //! ```
 //! use lychee_lib::Result;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<()> {
 //!   let response = lychee_lib::check("https://github.com/lycheeverse/lychee").await?;
-//!   println!("{}", response);
+//!   println!("{response}");
 //!   Ok(())
 //! }
 //! ```
@@ -26,6 +28,8 @@
 //!   Ok(())
 //! }
 //! ```
+//!
+//! [`lychee`]: https://github.com/lycheeverse/lychee
 #![warn(clippy::all, clippy::pedantic)]
 #![warn(
     absolute_paths_not_starting_with_crate,
@@ -39,43 +43,62 @@
     variant_size_differences,
     clippy::missing_const_for_fn
 )]
-#![deny(anonymous_parameters, macro_use_extern_crate, pointer_structural_match)]
+#![deny(anonymous_parameters, macro_use_extern_crate)]
 #![deny(missing_docs)]
 #![allow(clippy::module_name_repetitions)]
 
 #[cfg(doctest)]
 doc_comment::doctest!("../../README.md");
 
+mod basic_auth;
+pub mod chain;
+mod checker;
 mod client;
-mod client_pool;
 /// A pool of clients, to handle concurrent checks
 pub mod collector;
-mod helpers;
 mod quirks;
+mod retry;
 mod types;
+mod utils;
 
 /// Functionality to extract URIs from inputs
 pub mod extract;
+
+pub mod remap;
 
 /// Filters are a way to define behavior when encountering
 /// URIs that need to be treated differently, such as
 /// local IPs or e-mail addresses
 pub mod filter;
 
+/// Test utilities
 #[cfg(test)]
 #[macro_use]
 pub mod test_utils;
 
 #[cfg(test)]
 use doc_comment as _; // required for doctest
-use openssl_sys as _; // required for vendored-openssl feature
 use ring as _; // required for apple silicon
+
+#[cfg(feature = "native-tls")]
+use openssl_sys as _; // required for vendored-openssl feature
 
 #[doc(inline)]
 pub use crate::{
-    client::{check, ClientBuilder},
-    client_pool::ClientPool,
+    basic_auth::BasicAuthExtractor,
+    // Expose the `Handler` trait to allow defining external handlers (plugins)
+    chain::{ChainResult, Handler},
+    // Constants get exposed so that the CLI can use the same defaults as the library
+    client::{
+        check, Client, ClientBuilder, DEFAULT_MAX_REDIRECTS, DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_WAIT_TIME_SECS, DEFAULT_TIMEOUT_SECS, DEFAULT_USER_AGENT,
+    },
     collector::Collector,
     filter::{Excludes, Filter, Includes},
-    types::{Base, ErrorKind, Input, Request, Response, ResponseBody, Result, Status, Uri},
+    types::{
+        uri::valid::Uri, AcceptRange, AcceptRangeError, Base, BasicAuthCredentials,
+        BasicAuthSelector, CacheStatus, CookieJar, ErrorKind, FileType, Input, InputContent,
+        InputSource, Request, Response, ResponseBody, Result, Status, StatusCodeExcluder,
+        StatusCodeSelector,
+    },
 };

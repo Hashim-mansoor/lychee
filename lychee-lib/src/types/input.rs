@@ -1,18 +1,68 @@
 use crate::types::FileType;
-use crate::Result;
+use crate::{utils, ErrorKind, Result};
+use async_stream::try_stream;
+use futures::stream::Stream;
 use glob::glob_with;
+use ignore::WalkBuilder;
 use reqwest::Url;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use shellexpand::tilde;
+use std::fmt::Display;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::{fmt::Display, fs::read_to_string};
 use tokio::io::{stdin, AsyncReadExt};
 
 const STDIN: &str = "-";
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+
+// Check the extension of the given path against the list of known/accepted
+// file extensions
+fn valid_extension(p: &Path) -> bool {
+    matches!(FileType::from(p), FileType::Markdown | FileType::Html)
+}
+
+#[derive(Debug)]
+/// Encapsulates the content for a given input
+pub struct InputContent {
+    /// Input source
+    pub source: InputSource,
+    /// File type of given input
+    pub file_type: FileType,
+    /// Raw UTF-8 string content
+    pub content: String,
+}
+
+impl InputContent {
+    #[must_use]
+    /// Create an instance of `InputContent` from an input string
+    pub fn from_string(s: &str, file_type: FileType) -> Self {
+        // TODO: consider using Cow (to avoid one .clone() for String types)
+        Self {
+            source: InputSource::String(s.to_owned()),
+            file_type,
+            content: s.to_owned(),
+        }
+    }
+}
+
+impl TryFrom<&PathBuf> for InputContent {
+    type Error = crate::ErrorKind;
+
+    fn try_from(path: &PathBuf) -> std::result::Result<Self, Self::Error> {
+        let input =
+            fs::read_to_string(path).map_err(|e| ErrorKind::ReadFileInput(e, path.clone()))?;
+
+        Ok(Self {
+            source: InputSource::String(input.clone()),
+            file_type: FileType::from(path),
+            content: input,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[non_exhaustive]
-/// An exhaustive list of input sources, which lychee accepts
-pub enum Input {
+/// Input types which lychee supports
+pub enum InputSource {
     /// URL (of HTTP/HTTPS scheme).
     RemoteUrl(Box<Url>),
     /// Unix shell-style glob pattern.
@@ -30,7 +80,10 @@ pub enum Input {
     String(String),
 }
 
-impl Serialize for Input {
+// Custom serialization for enum is needed
+// Otherwise we get "key must be a string" when using the JSON writer
+// Related: https://github.com/serde-rs/json/issues/45
+impl Serialize for InputSource {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -39,68 +92,111 @@ impl Serialize for Input {
     }
 }
 
-impl Display for Input {
+impl Display for InputSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Input::RemoteUrl(url) => url.as_str(),
-            Input::FsGlob { pattern, .. } => pattern,
-            Input::FsPath(path) => path.to_str().unwrap_or_default(),
-            Input::Stdin => "stdin",
-            Input::String(_) => "raw input string",
+            Self::RemoteUrl(url) => url.as_str(),
+            Self::FsGlob { pattern, .. } => pattern,
+            Self::FsPath(path) => path.to_str().unwrap_or_default(),
+            Self::Stdin => "stdin",
+            Self::String(s) => s,
         })
     }
 }
 
-#[derive(Debug)]
-/// Encapsulates the content for a given input
-pub struct InputContent {
-    /// Input source
-    pub input: Input,
-    /// File type of given input
-    pub file_type: FileType,
-    /// Raw UTF-8 string content
-    pub content: String,
-}
-
-impl InputContent {
-    #[must_use]
-    /// Create an instance of `InputContent` from an input string
-    pub fn from_string(s: &str, file_type: FileType) -> Self {
-        // TODO: consider using Cow (to avoid one .clone() for String types)
-        Self {
-            input: Input::String(s.to_owned()),
-            file_type,
-            content: s.to_owned(),
-        }
-    }
+/// Lychee Input with optional file hint for parsing
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Input {
+    /// Origin of input
+    pub source: InputSource,
+    /// Hint to indicate which extractor to use
+    pub file_type_hint: Option<FileType>,
+    /// Excluded paths that will be skipped when reading content
+    pub excluded_paths: Option<Vec<PathBuf>>,
 }
 
 impl Input {
-    #[must_use]
     /// Construct a new `Input` source. In case the input is a `glob` pattern,
     /// `glob_ignore_case` decides whether matching files against the `glob` is
     /// case-insensitive or not
-    pub fn new(value: &str, glob_ignore_case: bool) -> Self {
-        if value == STDIN {
-            Self::Stdin
-        } else if let Ok(url) = Url::parse(value) {
-            Self::RemoteUrl(Box::new(url))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input does not exist (i.e. invalid path)
+    /// and the input cannot be parsed as a URL.
+    pub fn new(
+        value: &str,
+        file_type_hint: Option<FileType>,
+        glob_ignore_case: bool,
+        excluded_paths: Option<Vec<PathBuf>>,
+    ) -> Result<Self> {
+        let source = if value == STDIN {
+            InputSource::Stdin
         } else {
-            // this seems to be the only way to determine if this is a glob pattern
-            let is_glob = glob::Pattern::escape(value) != value;
-
-            if is_glob {
-                Self::FsGlob {
-                    pattern: value.to_owned(),
-                    ignore_case: glob_ignore_case,
+            // We use [`reqwest::Url::parse`] because it catches some other edge cases that [`http::Request:builder`] does not
+            // This could be improved with further refinement.
+            match Url::parse(value) {
+                // Weed out non-http schemes, including Windows drive specifiers, which will be successfully parsed by the Url crate
+                Ok(url) if url.scheme() == "http" || url.scheme() == "https" => {
+                    InputSource::RemoteUrl(Box::new(url))
                 }
-            } else {
-                Self::FsPath(value.into())
+                Ok(_) => {
+                    // URL parsed successfully, but it's not http or https
+                    return Err(ErrorKind::InvalidFile(PathBuf::from(value)));
+                }
+                _ => {
+                    // this seems to be the only way to determine if this is a glob pattern
+                    let is_glob = glob::Pattern::escape(value) != value;
+
+                    if is_glob {
+                        InputSource::FsGlob {
+                            pattern: value.to_owned(),
+                            ignore_case: glob_ignore_case,
+                        }
+                    } else {
+                        let path = PathBuf::from(value);
+
+                        // On Windows, a filepath can never be mistaken for a url because Windows filepaths use \ and urls use /
+                        #[cfg(windows)]
+                        if path.exists() {
+                            // The file exists, so we return the path
+                            InputSource::FsPath(path)
+                        } else {
+                            // We had a valid filepath, but the file didn't exist so we return an error
+                            return Err(ErrorKind::InvalidFile(path));
+                        }
+
+                        #[cfg(unix)]
+                        if path.exists() {
+                            InputSource::FsPath(path)
+                        } else if value.starts_with('~') || value.starts_with('.') {
+                            // The path is not valid, but it might be a valid URL
+                            // Check if the path starts with a tilde or a dot
+                            // and exit early if it does
+                            // This check might not be sufficient to cover all cases
+                            // but it catches the most common ones
+                            return Err(ErrorKind::InvalidFile(path));
+                        } else {
+                            // Invalid path; check if a valid URL can be constructed from the input
+                            // by prefixing it with a `http://` scheme.
+                            // Curl also uses http (i.e. not https), see
+                            // https://github.com/curl/curl/blob/70ac27604a2abfa809a7b2736506af0da8c3c8a9/lib/urlapi.c#L1104-L1124
+                            let url = Url::parse(&format!("http://{value}")).map_err(|e| {
+                                ErrorKind::ParseUrl(e, "Input is not a valid URL".to_string())
+                            })?;
+                            InputSource::RemoteUrl(Box::new(url))
+                        }
+                    }
+                }
             }
-        }
+        };
+        Ok(Self {
+            source,
+            file_type_hint,
+            excluded_paths,
+        })
     }
 
-    #[allow(clippy::missing_panics_doc)]
     /// Retrieve the contents from the input
     ///
     /// # Errors
@@ -108,28 +204,108 @@ impl Input {
     /// Returns an error if the contents can not be retrieved
     /// because of an underlying I/O error (e.g. an error while making a
     /// network request or retrieving the contents from the file system)
-    pub async fn get_contents(
-        &self,
-        file_type_hint: Option<FileType>,
+    pub fn get_contents(
+        self,
         skip_missing: bool,
-    ) -> Result<Vec<InputContent>> {
-        match *self {
-            // TODO: should skip_missing also affect URLs?
-            Input::RemoteUrl(ref url) => Ok(vec![Self::url_contents(url).await?]),
-            Input::FsGlob {
-                ref pattern,
-                ignore_case,
-            } => Ok(Self::glob_contents(pattern, ignore_case).await?),
-            Input::FsPath(ref path) => {
-                let content = Self::path_content(path);
-                match content {
-                    Ok(input_content) => Ok(vec![input_content]),
-                    Err(_) if skip_missing => Ok(vec![]),
-                    Err(e) => Err(e),
+        skip_hidden: bool,
+        skip_gitignored: bool,
+    ) -> impl Stream<Item = Result<InputContent>> {
+        try_stream! {
+            match self.source {
+                InputSource::RemoteUrl(ref url) => {
+                    let content = Self::url_contents(url).await;
+                    match content {
+                        Err(_) if skip_missing => (),
+                        Err(e) => Err(e)?,
+                        Ok(content) => yield content,
+                    }
+                },
+                InputSource::FsGlob {
+                    ref pattern,
+                    ignore_case,
+                } => {
+                    for await content in self.glob_contents(pattern, ignore_case) {
+                        let content = content?;
+                        yield content;
+                    }
                 }
+                InputSource::FsPath(ref path) => {
+                    if path.is_dir() {
+                        for entry in WalkBuilder::new(path).standard_filters(skip_gitignored).hidden(skip_hidden).build() {
+                            let entry = entry?;
+
+                            if self.is_excluded_path(&entry.path().to_path_buf()) {
+                                continue;
+                            }
+
+                            match entry.file_type() {
+                                None => continue,
+                                Some(file_type) => {
+                                    if !file_type.is_file() || !valid_extension(entry.path()) {
+                                        continue;
+                                    }
+                                }
+                            };
+
+                            let content = Self::path_content(entry.path()).await?;
+                            yield content
+                        }
+                    } else {
+                        if self.is_excluded_path(path) {
+                            return;
+                        }
+                        let content = Self::path_content(path).await;
+                        match content {
+                            Err(_) if skip_missing => (),
+                            Err(e) => Err(e)?,
+                            Ok(content) => yield content,
+                        };
+                    }
+                },
+                InputSource::Stdin => {
+                    let content = Self::stdin_content(self.file_type_hint).await?;
+                    yield content;
+                },
+                InputSource::String(ref s) => {
+                    let content = Self::string_content(s, self.file_type_hint);
+                    yield content;
+                },
             }
-            Input::Stdin => Ok(vec![Self::stdin_content(file_type_hint).await?]),
-            Input::String(ref s) => Ok(vec![Self::string_content(s, file_type_hint)]),
+        }
+    }
+
+    /// Retrieve all sources from this input. The output depends on the type of
+    /// input:
+    ///
+    /// - Remote URLs are returned as is, in their full form
+    /// - Filepath Glob Patterns are expanded and each matched entry is returned
+    /// - Absolute or relative filepaths are returned as is
+    /// - All other input types are not returned
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the globbing fails with the expanded pattern.
+    pub fn get_sources(self) -> impl Stream<Item = Result<String>> {
+        try_stream! {
+            match self.source {
+                InputSource::RemoteUrl(url) => yield url.to_string(),
+                InputSource::FsGlob { pattern, ignore_case } => {
+                    let glob_expanded = tilde(&pattern).to_string();
+                    let mut match_opts = glob::MatchOptions::new();
+
+                    match_opts.case_sensitive = !ignore_case;
+
+                    for entry in glob_with(&glob_expanded, match_opts)? {
+                        match entry {
+                            Ok(path) => yield path.to_string_lossy().to_string(),
+                            Err(e) => eprintln!("{e:?}")
+                        }
+                    }
+                },
+                InputSource::FsPath(path) => yield path.to_string_lossy().to_string(),
+                InputSource::Stdin => yield "Stdin".into(),
+                InputSource::String(_) => yield "Raw String".into(),
+            }
         }
     }
 
@@ -141,54 +317,75 @@ impl Input {
             FileType::from(url.as_str())
         };
 
-        let res = reqwest::get(url.clone()).await?;
+        let res = reqwest::get(url.clone())
+            .await
+            .map_err(ErrorKind::NetworkRequest)?;
         let input_content = InputContent {
-            input: Input::RemoteUrl(Box::new(url.clone())),
+            source: InputSource::RemoteUrl(Box::new(url.clone())),
             file_type,
-            content: res.text().await?,
+            content: res.text().await.map_err(ErrorKind::ReadResponseBody)?,
         };
 
         Ok(input_content)
     }
 
-    async fn glob_contents(path_glob: &str, ignore_case: bool) -> Result<Vec<InputContent>> {
-        let mut contents = vec![];
-        let glob_expanded = tilde(&path_glob);
+    fn glob_contents(
+        &self,
+        pattern: &str,
+        ignore_case: bool,
+    ) -> impl Stream<Item = Result<InputContent>> + '_ {
+        let glob_expanded = tilde(&pattern).to_string();
         let mut match_opts = glob::MatchOptions::new();
 
         match_opts.case_sensitive = !ignore_case;
 
-        for entry in glob_with(&glob_expanded, match_opts)? {
-            match entry {
-                Ok(path) => {
-                    if path.is_dir() {
-                        // Directories can still have a suffix which looks like
-                        // a file extension like `foo.html`. This can lead to
+        try_stream! {
+            for entry in glob_with(&glob_expanded, match_opts)? {
+                match entry {
+                    Ok(path) => {
+                        // Directories can have a suffix which looks like
+                        // a file extension (like `foo.html`). This can lead to
                         // unexpected behavior with glob patterns like
                         // `**/*.html`. Therefore filter these out.
-                        // https://github.com/lycheeverse/lychee/pull/262#issuecomment-913226819
-                        continue;
+                        // See <https://github.com/lycheeverse/lychee/pull/262#issuecomment-913226819>
+                        if path.is_dir() {
+                            continue;
+                        }
+                        if self.is_excluded_path(&path) {
+                            continue;
+                        }
+                        let content: InputContent = Self::path_content(&path).await?;
+                        yield content;
                     }
-                    let content = Self::path_content(&path)?;
-                    contents.push(content);
+                    Err(e) => eprintln!("{e:?}"),
                 }
-                Err(e) => println!("{:?}", e),
             }
         }
+    }
 
-        Ok(contents)
+    /// Check if the given path was excluded from link checking
+    fn is_excluded_path(&self, path: &PathBuf) -> bool {
+        let Some(excluded_paths) = &self.excluded_paths else {
+            return false;
+        };
+        is_excluded_path(excluded_paths, path)
     }
 
     /// Get the input content of a given path
     /// # Errors
     ///
     /// Will return `Err` if file contents can't be read
-    pub fn path_content<P: Into<PathBuf> + AsRef<Path> + Clone>(path: P) -> Result<InputContent> {
-        let content = read_to_string(&path).map_err(|e| (path.clone().into(), e))?;
+    pub async fn path_content<P: Into<PathBuf> + AsRef<Path> + Clone>(
+        path: P,
+    ) -> Result<InputContent> {
+        let path = path.into();
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| ErrorKind::ReadFileInput(e, path.clone()))?;
         let input_content = InputContent {
-            file_type: FileType::from(path.as_ref()),
+            file_type: FileType::from(&path),
+            source: InputSource::FsPath(path),
             content,
-            input: Input::FsPath(path.into()),
         };
 
         Ok(input_content)
@@ -200,7 +397,7 @@ impl Input {
         stdin.read_to_string(&mut content).await?;
 
         let input_content = InputContent {
-            input: Input::Stdin,
+            source: InputSource::Stdin,
             file_type: file_type_hint.unwrap_or_default(),
             content,
         };
@@ -210,5 +407,215 @@ impl Input {
 
     fn string_content(s: &str, file_type_hint: Option<FileType>) -> InputContent {
         InputContent::from_string(s, file_type_hint.unwrap_or_default())
+    }
+}
+
+/// Function for path exclusion tests
+///
+/// This is a standalone function to allow for easier testing
+fn is_excluded_path(excluded_paths: &[PathBuf], path: &PathBuf) -> bool {
+    for excluded in excluded_paths {
+        if let Ok(true) = utils::path::contains(excluded, path) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_input_handles_real_relative_paths() {
+        let test_file = "./Cargo.toml";
+        let path = Path::new(test_file);
+
+        assert!(path.exists());
+        assert!(path.is_relative());
+
+        let input = Input::new(test_file, None, false, None);
+        assert!(input.is_ok());
+        assert!(matches!(
+            input,
+            Ok(Input {
+                source: InputSource::FsPath(PathBuf { .. }),
+                file_type_hint: None,
+                excluded_paths: None
+            })
+        ));
+    }
+
+    #[test]
+    fn test_input_handles_nonexistent_relative_paths() {
+        let test_file = "./nonexistent/relative/path";
+        let path = Path::new(test_file);
+
+        assert!(!path.exists());
+        assert!(path.is_relative());
+
+        let input = Input::new(test_file, None, false, None);
+        assert!(input.is_err());
+        assert!(matches!(input, Err(ErrorKind::InvalidFile(PathBuf { .. }))));
+    }
+
+    #[test]
+    fn test_valid_extension() {
+        assert!(valid_extension(Path::new("file.md")));
+        assert!(valid_extension(Path::new("file.markdown")));
+        assert!(valid_extension(Path::new("file.html")));
+        assert!(valid_extension(Path::new("file.htm")));
+        assert!(valid_extension(Path::new("file.HTM")));
+        assert!(!valid_extension(Path::new("file.txt")));
+        assert!(!valid_extension(Path::new("file")));
+    }
+
+    #[test]
+    fn test_no_exclusions() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_excluded_path(&[], &dir.path().to_path_buf()));
+    }
+
+    #[test]
+    fn test_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        assert!(is_excluded_path(&[path.clone()], &path));
+    }
+
+    #[test]
+    fn test_excluded_subdir() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = parent_dir.path();
+        let child_dir = tempfile::tempdir_in(parent).unwrap();
+        let child = child_dir.path();
+        assert!(is_excluded_path(
+            &[parent.to_path_buf()],
+            &child.to_path_buf()
+        ));
+    }
+
+    #[test]
+    fn test_url_without_scheme() {
+        let input = Input::new("example.com", None, false, None);
+        assert_eq!(
+            input.unwrap().source.to_string(),
+            String::from("http://example.com/")
+        );
+    }
+
+    // Ensure that a Windows file path is not mistaken for a URL.
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_style_filepath_not_existing() {
+        let input = Input::new("C:\\example\\project\\here", None, false, None);
+        assert!(input.is_err());
+        let input = input.unwrap_err();
+
+        match input {
+            ErrorKind::InvalidFile(_) => (),
+            _ => panic!("Should have received InvalidFile error"),
+        }
+    }
+
+    // Ensure that a Windows-style file path to an existing file is recognized
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_style_filepath_existing() {
+        use std::env::temp_dir;
+        use tempfile::NamedTempFile;
+
+        let dir = temp_dir();
+        let file = NamedTempFile::new_in(dir).unwrap();
+        let path = file.path();
+        let input = Input::new(path.to_str().unwrap(), None, false, None).unwrap();
+
+        match input.source {
+            InputSource::FsPath(_) => (),
+            _ => panic!("Input source should be FsPath but was not"),
+        }
+    }
+
+    #[test]
+    fn test_url_scheme_check_succeeding() {
+        // Valid http and https URLs
+        assert!(matches!(
+            Input::new("http://example.com", None, false, None),
+            Ok(Input {
+                source: InputSource::RemoteUrl(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Input::new("https://example.com", None, false, None),
+            Ok(Input {
+                source: InputSource::RemoteUrl(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Input::new(
+                "http://subdomain.example.com/path?query=value",
+                None,
+                false,
+                None
+            ),
+            Ok(Input {
+                source: InputSource::RemoteUrl(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Input::new("https://example.com:8080", None, false, None),
+            Ok(Input {
+                source: InputSource::RemoteUrl(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_url_scheme_check_failing() {
+        // Invalid schemes
+        assert!(matches!(
+            Input::new("ftp://example.com", None, false, None),
+            Err(ErrorKind::InvalidFile(_))
+        ));
+        assert!(matches!(
+            Input::new("httpx://example.com", None, false, None),
+            Err(ErrorKind::InvalidFile(_))
+        ));
+        assert!(matches!(
+            Input::new("file:///path/to/file", None, false, None),
+            Err(ErrorKind::InvalidFile(_))
+        ));
+        assert!(matches!(
+            Input::new("mailto:user@example.com", None, false, None),
+            Err(ErrorKind::InvalidFile(_))
+        ));
+    }
+
+    #[test]
+    fn test_non_url_inputs() {
+        // Non-URL inputs
+        assert!(matches!(
+            Input::new("./local/path", None, false, None),
+            Err(ErrorKind::InvalidFile(_))
+        ));
+        assert!(matches!(
+            Input::new("*.md", None, false, None),
+            Ok(Input {
+                source: InputSource::FsGlob { .. },
+                ..
+            })
+        ));
+        // Assuming the current directory exists
+        assert!(matches!(
+            Input::new(".", None, false, None),
+            Ok(Input {
+                source: InputSource::FsPath(_),
+                ..
+            })
+        ));
     }
 }
